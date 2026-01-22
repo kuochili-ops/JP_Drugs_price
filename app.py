@@ -4,7 +4,12 @@ import requests
 import io
 import re
 
-st.set_page_config(page_title="KEGG 藥物精確譯名工具", layout="wide")
+# Azure 認證資訊
+AZURE_KEY = "ArkttUAhQYKvd5vh8AB8UTvMiYqNghwaZauenxSLf5A2ptgKtQnHJQQJ99BLAC3pKaRXJ3w3AAAbACOG9KPB"
+AZURE_REGION = "eastasia"
+AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0"
+
+st.set_page_config(page_title="KEGG + Azure 藥物譯名工具", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_kegg_mapping():
@@ -12,81 +17,96 @@ def get_kegg_mapping():
     try:
         response = requests.get(url)
         response.encoding = 'utf-8'
-        if response.status_code != 200:
-            return []
-        
         mapping_list = []
         for line in response.text.strip().split('\n'):
             parts = line.split('\t')
             if len(parts) >= 2:
-                # 原始字串範例: "別名1; 別名2; Botulinum toxin; (JAN)"
                 all_names = [n.strip() for n in parts[1].split('; ')]
-                
-                # --- 核心邏輯：尋找第一個合格的英文名詞 ---
-                final_en = "N/A"
+                final_en = None
                 for name in all_names:
-                    # 檢查是否為英文：判斷是否包含多個英文字母，且不包含日文字元 (假名/漢字)
-                    # 我們排除掉純日文項，直到找到主要為英文的項目
                     has_japanese = re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', name)
-                    has_english = re.search(r'[a-zA-Z]{2,}', name) # 至少包含兩個英文字母
-                    
+                    has_english = re.search(r'[a-zA-Z]{2,}', name)
                     if has_english and not has_japanese:
-                        # 找到後，移除括號標註如 (JAN), (USP)
                         final_en = re.sub(r'[\(（].*?[\)）]', '', name).strip()
                         break 
                 
-                # --- 建立所有日文別名對應到該英文名的索引 ---
                 for name in all_names:
                     clean_key = re.sub(r'[\(（].*?[\)）]', '', name).strip()
-                    # 只要該別名包含日文字，就當作 Key
                     if re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', clean_key):
-                        mapping_list.append({
-                            'key': clean_key,
-                            'en': final_en
-                        })
-        
-        # 按長度排序，確保「アムロジピンベシル酸塩」先於「アムロジピン」
+                        mapping_list.append({'key': clean_key, 'en': final_en})
         return sorted(mapping_list, key=lambda x: len(x['key']), reverse=True)
-    except Exception as e:
-        st.error(f"API 載入失敗: {e}")
+    except Exception:
         return []
+
+def translate_with_azure(text):
+    """當 KEGG 找不到時，調用 Azure 翻譯"""
+    if not text: return None
+    headers = {
+        'Ocp-Apim-Subscription-Key': AZURE_KEY,
+        'Ocp-Apim-Subscription-Region': AZURE_REGION,
+        'Content-type': 'application/json'
+    }
+    # 移除劑型後綴再翻譯以提高準確度
+    clean_text = re.sub(r'(錠|注|散|シロップ|液|原末)$', '', str(text))
+    body = [{'text': clean_text}]
+    params = {'from': 'ja', 'to': 'en'}
+    
+    try:
+        res = requests.post(AZURE_ENDPOINT, params=params, headers=headers, json=body)
+        res.raise_for_status()
+        result = res.json()
+        return result[0]['translations'][0]['text']
+    except Exception as e:
+        return f"Translation Error: {e}"
 
 def find_match(cell_value, mapping_list):
     if pd.isna(cell_value): return None
-    # 正規化 Excel 內容：統一全形英數為半形，並移除空格
-    target = str(cell_value).translate(str.maketrans('ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ０１２３４５６７８９', 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789')).replace(' ', '').replace('　', '').strip()
+    # 全形轉半形
+    target = str(cell_value).translate(str.maketrans(
+        'ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ０１２３４５６７８９',
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    )).replace(' ', '').replace('　', '').strip()
     
+    # 1. 嘗試 KEGG 比對
     for item in mapping_list:
-        if item['key'] in target:
-            return item['en']
-    return None
+        if item['key'] in target and item['en']:
+            return item['en'], "KEGG"
+    
+    # 2. 比對失敗，使用 Azure 翻譯
+    translated = translate_with_azure(target)
+    return translated, "Azure AI"
 
-# --- UI 介面 ---
-st.title("💊 KEGG 藥物日譯英 (精確英文過濾版)")
-st.info("規則：搜尋分號標籤，排除日文別名，直到找到純英文名詞為止。")
+# --- UI ---
+st.title("💊 藥物譯名終極工具 (KEGG + Azure AI)")
+st.info("優先從 KEGG 獲取專業醫學譯名；若無紀錄，則自動透過 Azure Cognitive Services 翻譯。")
 
 mapping_list = get_kegg_mapping()
 
-uploaded_file = st.file_uploader("上傳 XLSX 或 CSV", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("上傳 XLSX / CSV", type=["xlsx", "csv"])
 
 if uploaded_file:
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file, encoding='utf-8')
-        else:
-            df = pd.read_excel(uploaded_file)
-    except UnicodeDecodeError:
-        df = pd.read_csv(uploaded_file, encoding='shift-jis')
-
-    target_col = st.selectbox("請選擇『成分名』欄位", df.columns)
+    df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
+    target_col = st.selectbox("選擇成分欄位", df.columns)
     
-    if st.button("🚀 開始執行"):
-        with st.spinner('逐層分析別名中...'):
-            df['英文成分名'] = df[target_col].apply(lambda x: find_match(x, mapping_list))
-            st.success("比對完成！已過濾掉中間的日文別名。")
-            st.dataframe(df)
+    if st.button("🚀 開始全自動對照"):
+        results = []
+        sources = []
+        progress_bar = st.progress(0)
+        total = len(df)
 
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False)
-            st.download_button("📥 下載 Excel 結果", output.getvalue(), "kegg_translation_final.xlsx")
+        for i, val in enumerate(df[target_col]):
+            res, src = find_match(val, mapping_list)
+            results.append(res)
+            sources.append(src)
+            progress_bar.progress((i + 1) / total)
+        
+        df['英文成分名'] = results
+        df['來源'] = sources
+        
+        st.success(f"完成！KEGG 命中: {sources.count('KEGG')} 筆, Azure 翻譯: {sources.count('Azure AI')} 筆")
+        st.dataframe(df)
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False)
+        st.download_button("📥 下載完整結果", output.getvalue(), "medical_translation_final.xlsx")
