@@ -2,64 +2,33 @@ import streamlit as st
 import pandas as pd
 import requests
 import io
+import re
 
-st.set_page_config(page_title="KEGG 藥物成分日譯英工具", layout="centered")
+# ... (前面 get_kegg_mapping 保持不變) ...
 
-@st.cache_data(ttl=86400)  # 快取資料 24 小時，避免頻繁請求 API
-def get_kegg_mapping():
-    url = "https://rest.kegg.jp/list/drug_ja"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        mapping = {}
-        for line in response.text.strip().split('\n'):
-            parts = line.split('\t')
-            if len(parts) >= 2:
-                names = parts[1].split('; ')
-                if len(names) >= 2:
-                    jp_name = names[0].strip()
-                    en_name = names[1].strip()
-                    mapping[jp_name] = en_name
-        return mapping
-    except Exception as e:
-        st.error(f"無法從 KEGG 獲取資料: {e}")
-        return {}
+def clean_text(text):
+    """清理字串：轉小寫、去空格、移除括號內容"""
+    if pd.isna(text):
+        return ""
+    text = str(text).strip()
+    # 移除括號及其內容，例如：アセチルサリチル酸（JAN） -> アセチルサリチル酸
+    text = re.sub(r'（[^）]*）', '', text)
+    text = re.sub(r'\([^)]*\)', '', text)
+    return text.strip()
 
-st.title("💊 KEGG 藥物日譯英轉換器")
-st.write("上傳包含日文成分名的 XLSX 檔，自動對比並新增英文名稱。")
-
-# 1. 獲取對照表
-kegg_dict = get_kegg_mapping()
-
-# 2. 上傳檔案
-uploaded_file = st.file_uploader("選擇 XLSX 檔案", type=["xlsx"])
-
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    st.write("### 預覽上傳資料", df.head())
-    
-    # 讓使用者選擇欄位
-    target_col = st.selectbox("請選擇『成分名』所在的欄位：", df.columns)
-    
-    if st.button("開始轉換"):
-        with st.spinner('轉換中...'):
-            # 進行對比
-            df['英文成分名'] = df[target_col].map(kegg_dict)
-            
-            # 計算成功率
-            match_count = df['英文成分名'].notna().sum()
-            st.success(f"轉換完成！成功比對出 {match_count} 筆英文名稱。")
-            
-            st.write("### 轉換結果預覽", df.head())
-
-            # 準備下載檔案
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False)
-            
-            st.download_button(
-                label="📥 下載處理後的 Excel",
-                data=output.getvalue(),
-                file_name="translated_drugs.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+# --- 在「開始轉換」按鈕內的邏輯修改如下 ---
+if st.button("開始轉換"):
+    with st.spinner('優化比對中...'):
+        # 1. 建立一個「清理過」的對照字典
+        # 原本：{"アセチルサリチル酸": "Aspirin"}
+        # 這裡確保對照表也是乾淨的
+        clean_dict = {clean_text(k): v for k, v in kegg_dict.items()}
+        
+        # 2. 對 Excel 的欄位進行清理後再比對
+        df['temp_clean_col'] = df[target_col].apply(clean_text)
+        df['英文成分名'] = df['temp_clean_col'].map(clean_dict)
+        
+        # 3. 刪除暫存欄位
+        df.drop(columns=['temp_clean_col'], inplace=True)
+        
+        # ... (後續顯示結果與下載) ...
