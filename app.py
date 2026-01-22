@@ -4,72 +4,82 @@ import requests
 import io
 import re
 
-# 禁用沉浸式翻譯插件可能導致的 UI 錯誤
-st.markdown("""
-    <style>
-    .stApp {
-        overflow: auto;
-    }
-    </style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="KEGG 藥物比對工具", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_kegg_mapping():
     url = "https://rest.kegg.jp/list/drug_ja"
     try:
         response = requests.get(url)
-        response.raise_for_status()
+        response.encoding = 'utf-8' # 強制使用 utf-8 處理漢字
         mapping_list = []
         for line in response.text.strip().split('\n'):
             parts = line.split('\t')
             if len(parts) >= 2:
-                # 取得日文名與英文名
                 names = parts[1].split('; ')
                 if len(names) >= 2:
                     raw_jp = names[0].strip()
-                    # 清理 API 的日文名：移除括號內容 (例如: (JP18) -> "")
+                    # 移除所有類型的括號及其內容，避免 "(JP18)" 影響比對
                     clean_jp = re.sub(r'[\(（].*?[\)）]', '', raw_jp).strip()
-                    
-                    mapping_list.append({
-                        'clean_jp': clean_jp,
-                        'en': names[1].strip()
-                    })
-        # 按照長度排序，先比對長的字串，防止誤判
+                    if clean_jp:
+                        mapping_list.append({
+                            'clean_jp': clean_jp,
+                            'en': names[1].strip()
+                        })
+        # 按照字串長度排序 (由長到短)，這對漢字比對至關重要
         return sorted(mapping_list, key=lambda x: len(x['clean_jp']), reverse=True)
     except Exception as e:
-        st.error(f"API 連線異常: {e}")
+        st.error(f"KEGG 連線異常: {e}")
         return []
 
 def find_match(cell_value, mapping_list):
     if pd.isna(cell_value): return None
     
-    # 預處理 Excel 儲存格：移除所有全角/半角空格
-    target = str(cell_value).replace(' ', '').replace('　', '')
+    # 1. 清理 Excel 儲存格字串：移除空白、換行
+    target = str(cell_value).replace(' ', '').replace('　', '').strip()
     
-    # 優先嘗試「完整包含」比對
+    # 2. 進行包含比對
     for item in mapping_list:
-        if item['clean_jp'] and item['clean_jp'] in target:
+        # 如果 API 的 clean_jp (例如: ドロペリドール) 在 Excel 格子裡 (例如: ドロペリドール注)
+        if item['clean_jp'] in target:
             return item['en']
-            
-    return "無匹配結果"
+    
+    return None
 
-# --- Streamlit UI ---
-st.title("💊 藥物日譯英轉換工具")
+st.title("💊 藥物日譯英轉換器 (漢字強化版)")
+
 mapping_list = get_kegg_mapping()
 
-uploaded_file = st.file_uploader("上傳 Excel 或 CSV", type=["xlsx", "csv"])
+# 提供除錯資訊：查看 API 抓到了多少筆
+if mapping_list:
+    st.sidebar.success(f"目前對照表共有 {len(mapping_list)} 筆成分")
+
+uploaded_file = st.file_uploader("上傳檔案 (XLSX 或 CSV)", type=["xlsx", "csv"])
 
 if uploaded_file:
-    df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
-    target_col = st.selectbox("請選擇『成分名』欄位", df.columns)
+    # 處理 CSV 編碼，防止漢字亂碼
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file, encoding='utf-8')
+        else:
+            df = pd.read_excel(uploaded_file)
+    except UnicodeDecodeError:
+        df = pd.read_csv(uploaded_file, encoding='shift-jis')
+
+    target_col = st.selectbox("選擇包含『成分名』的欄位", df.columns)
     
-    if st.button("執行轉換"):
-        with st.spinner('比對中...'):
+    if st.button("開始比對"):
+        with st.spinner('正在比對漢字與假名...'):
             df['英文成分名'] = df[target_col].apply(lambda x: find_match(x, mapping_list))
-            st.dataframe(df)
             
-            # 檔案下載邏輯
+            # 統計結果
+            success_df = df[df['英文成分名'].notna()]
+            st.success(f"完成！成功比對 {len(success_df)} 筆，失敗 {len(df)-len(success_df)} 筆。")
+            
+            st.dataframe(df)
+
+            # 下載
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False)
-            st.download_button("📥 下載結果", output.getvalue(), "translated.xlsx")
+            st.download_button("📥 下載 Excel 結果", output.getvalue(), "kegg_results.xlsx")
